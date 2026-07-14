@@ -1,0 +1,55 @@
+{
+  "customers": [
+    {
+      "id": "cust-1",
+      "name": "Tan Brothers Pte Ltd",
+      "email": "tan@example.com"
+    },
+    {
+      "id": "cust-2",
+      "name": "Lim & Sons Engineering",
+      "email": "lim@example.com"
+    },
+    {
+      "id": "0fdff710-bf43-4d32-a254-09e82d583f84",
+      "created_at": "2026-07-14T13:41:18.487597+00:00",
+      "name": "New Corp",
+      "email": "new@corp.com"
+    },
+    {
+      "id": "4566c4c4-ffd6-499a-b295-6e6454904a44",
+      "created_at": "2026-07-14T13:42:25.416574+00:00",
+      "name": "New Corp",
+      "email": "new@corp.com"
+    },
+    {
+      "id": "94a0cc2f-c1d4-4651-9d2d-251733633aae",
+      "created_at": "2026-07-14T13:43:10.213516+00:00",
+      "name": "New Corp 2",
+      "email": "new2@corp.com"
+    }
+  ],
+  "jobs": [
+    {
+      "id": "job-1",
+      "customer_id": "cust-1",
+      "title": "Office Rewire",
+      "status": "In Progress"
+    }
+  ],
+  "invoices": [],
+  "tasks": [
+    {
+      "id": "task-1",
+      "job_id": "job-1",
+      "title": "Site survey",
+      "done": true
+    },
+    {
+      "id": "task-2",
+      "job_id": "job-1",
+      "title": "Cable run",
+      "done": false
+    }
+  ]
+}

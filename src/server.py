@@ -1,152 +1,47 @@
 """CDO MCP Server — exposes the canonical data model as MCP tools.
 
-Week 3 scaffold: single echo tool to verify the server starts
-and is visible in Claude Desktop before adding real data tools.
-
-What is MCP?
-    MCP (Model Context Protocol) is a standard that lets Claude talk to
-    external tools and data sources. This server registers 'tools' that
-    Claude can call — like functions Claude can invoke on your behalf.
-
-How does the server talk to Claude Desktop?
-    Claude Desktop launches this script as a subprocess and communicates
-    over stdio (standard input/output). Every message Claude sends comes
-    in via stdin; every response goes back via stdout. That's why all our
-    logging goes to stderr — we must not pollute stdout with debug text.
+Runs in stdio mode (default) for Claude Desktop integration.
+MCP (Model Context Protocol) lets Claude call the functions below as tools.
+All logging goes to stderr so it does not pollute the stdio message stream.
 """
 
 # ── Imports ───────────────────────────────────────────────────────────────────
-# argparse: Python's built-in library for parsing command-line arguments.
-#   e.g. lets us run: python server.py --transport http
-import argparse
+import datetime   # for timestamping new records
+import logging    # for diagnostic messages to stderr
+import pathlib    # for resolving the src/ directory path
+import sys        # for sys.stderr (log destination) and sys.path
+import uuid       # for generating unique IDs on new records
 
-# logging: Python's built-in library for printing diagnostic messages.
-#   Using it instead of print() gives us timestamps, severity levels
-#   (INFO, WARNING, ERROR), and easy control over output destination.
-import logging
+from mcp.server.fastmcp import FastMCP   # high-level MCP server library
 
-# sys: gives access to sys.stderr (the error output stream) and sys.argv
-#   (the list of command-line arguments passed to the script).
-import sys
-
-# FastMCP: a high-level Python library that makes it easy to build MCP servers.
-#   The @mcp.tool() decorator is how we register a Python function as a tool
-#   that Claude can discover and call.
-from mcp.server.fastmcp import FastMCP
+# Ensure the src/ directory is on sys.path so `from data import ...` works
+# whether this file is run directly (python src/server.py) or imported as a
+# package (from src.server import ...) — e.g. in tests.
+sys.path.insert(0, str(pathlib.Path(__file__).parent))
+from data import get_db, write_db
 
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
-# basicConfig sets up the global logging configuration once at startup.
-#
-# stream=sys.stderr  → write log lines to stderr, NOT stdout.
-#                       MCP uses stdout to send/receive protocol messages,
-#                       so mixing logs into stdout would break the connection.
-#
-# level=logging.INFO → show messages at INFO level and above (INFO, WARNING,
-#                       ERROR, CRITICAL). DEBUG messages are hidden by default.
-#                       Change to logging.DEBUG while troubleshooting to see
-#                       more detail.
-#
-# format=...         → how each log line looks. %(asctime)s is the timestamp,
-#                       %(levelname)s is INFO/WARNING/etc, %(message)s is
-#                       the text we pass to logger.info() / logger.warning().
+# Writes to stderr so log lines never mix with the MCP stdio message stream.
 logging.basicConfig(
     stream=sys.stderr,
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
-
-# getLogger(__name__) creates a logger named after this file/module.
-# Using __name__ (which equals "__main__" when run directly, or the module
-# name when imported) lets Python's logging system identify where each
-# message came from if you later have multiple modules logging.
 logger = logging.getLogger(__name__)
 
 
 # ── Server constants ──────────────────────────────────────────────────────────
-# Constants are variables that never change after they're defined.
-# By convention, Python names them in ALL_CAPS.
-#
-# SERVER_NAME appears in Claude Desktop's tool list — it's how the user
-# identifies which server a tool belongs to.
-#
-# SERVER_VERSION follows Semantic Versioning (semver): MAJOR.MINOR.PATCH.
-# Bump PATCH for bug fixes, MINOR for new tools, MAJOR for breaking changes.
 SERVER_NAME = "CDO Data Server"
 SERVER_VERSION = "0.1.0"
-DEFAULT_HTTP_PORT = 3001  # matches the port configured in Claude Code / VSCode
-
-
-# ── Argument parsing (early) ──────────────────────────────────────────────────
-# We parse args here — before creating the FastMCP instance — because the
-# port must be passed to the FastMCP constructor. It cannot be set later.
-#
-# argparse normally reads sys.argv[1:], so nothing is consumed here at import
-# time; it only runs when the script is executed directly (see __main__ below).
-# But we call _parse_args() at module level so @mcp.tool()-decorated functions
-# can be defined on the correctly-configured mcp object.
-def _parse_args() -> "argparse.Namespace":
-    """Parse command-line arguments and return them as a Namespace object.
-
-    A Namespace is just an object whose attributes match the argument names,
-    so after parsing you can do args.transport to get the value.
-    """
-    # ArgumentParser creates the argument parser with a helpful description
-    # that shows up when you run: python server.py --help
-    parser = argparse.ArgumentParser(description="CDO MCP Server")
-
-    # add_argument defines a single CLI flag.
-    #   "--transport"        the flag name (double-dash = optional argument)
-    #   choices=[...]        only these values are accepted; anything else
-    #                        causes an error with a helpful message
-    #   default="stdio"      used if --transport is not provided at all
-    #   help=...             shown in --help output
-    #
-    # Usage examples:
-    #   python server.py                     → transport is "stdio" (default)
-    #   python server.py --transport http    → transport is "http"
-    parser.add_argument(
-        "--transport",
-        choices=["stdio", "sse", "streamable-http"],
-        default="stdio",
-        help="Transport to use (default: stdio for Claude Desktop; streamable-http for Claude Code / VSCode)",
-    )
-
-    # --port controls which TCP port the HTTP server listens on.
-    # Only relevant when --transport http is used.
-    # Default matches the port configured in Claude Code / VSCode extension.
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=DEFAULT_HTTP_PORT,
-        help=f"Port for HTTP transport (default: {DEFAULT_HTTP_PORT})",
-    )
-
-    return parser.parse_args()
-
-
-_args = _parse_args()
 
 
 # ── Create the MCP server instance ────────────────────────────────────────────
-# FastMCP(SERVER_NAME, port=...) creates the server object. The port is set
-# here in the constructor — FastMCP.run() does not accept a port argument.
-# port= is only used when transport="http"; it is ignored for stdio.
-# streamable_http_path="/sse" matches the URL Claude Code / VSCode sends requests to.
-# FastMCP defaults to "/mcp" but the extension is hard-coded to POST to "/sse".
-mcp = FastMCP(SERVER_NAME, port=_args.port, streamable_http_path="/sse")
-
-# Log a message so we can see in the terminal that this line was reached.
+mcp = FastMCP(SERVER_NAME)
 logger.info("Initialised %s v%s", SERVER_NAME, SERVER_VERSION)
 
 
-# ── Echo tool ─────────────────────────────────────────────────────────────────
-# The @mcp.tool() decorator registers the function below as an MCP tool.
-# A 'decorator' in Python is a way to wrap a function with extra behaviour —
-# here it tells FastMCP "make this function callable by Claude."
-#
-# Claude reads the function's docstring to understand what the tool does,
-# and reads the type hints (message: str) to know what arguments to pass.
+# ── Diagnostic tools ──────────────────────────────────────────────────────────
 @mcp.tool()
 def echo(message: str) -> str:
     """Echo a message back. Used to verify the MCP server is running correctly.
@@ -157,21 +52,10 @@ def echo(message: str) -> str:
     Returns:
         The same string prefixed with 'CDO MCP echo: '
     """
-    # %r formats the message with quotes around it (repr format), so if
-    # message is hello, the log shows: echo called with: 'hello'
-    # This makes it easy to spot if the string contains unexpected spaces
-    # or special characters.
     logger.info("echo called with: %r", message)
-
-    # f-strings let us embed variables directly inside a string using {}.
-    # This returns something like: "CDO MCP echo: hello world"
     return f"CDO MCP echo: {message}"
 
 
-# ── Status tool ───────────────────────────────────────────────────────────────
-# The return type hint `-> dict` means this function returns a Python
-# dictionary — a collection of key-value pairs, like a small JSON object.
-# FastMCP automatically converts the dict to JSON when sending it to Claude.
 @mcp.tool()
 def status() -> dict:
     """Return the server name, version, and list of registered tools.
@@ -179,19 +63,10 @@ def status() -> dict:
     Returns:
         A dict with keys 'server', 'version', and 'tools'.
     """
-    # mcp._tool_manager._tools is an internal dict inside FastMCP where
-    # all registered tools are stored, keyed by their function name.
-    # The leading underscore (_) on _tool_manager and _tools is a Python
-    # convention meaning "this is private / internal — use with care."
-    # We use it here because FastMCP doesn't expose a public API for this yet.
-    #
-    # .keys() returns all the key names from that dict (i.e. tool names).
-    # list(...) converts them from a dict_keys view into a plain Python list.
+    # _tool_manager._tools is FastMCP's internal registry of all registered tools.
+    # The underscore prefix means it's private/internal — no public API exists yet.
     tool_names = list(mcp._tool_manager._tools.keys())
     logger.info("status called — tools: %s", tool_names)
-
-    # Return a dict that Claude will receive as a JSON object, e.g.:
-    # { "server": "CDO Data Server", "version": "0.1.0", "tools": ["echo", "status"] }
     return {
         "server": SERVER_NAME,
         "version": SERVER_VERSION,
@@ -199,16 +74,68 @@ def status() -> dict:
     }
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
-# `if __name__ == "__main__":` is a Python idiom that means:
-#   "only run this block if the script was executed directly (e.g.
-#    python server.py), NOT if it was imported by another module."
-# This prevents the server from starting automatically when the file is
-# imported in tests or other scripts.
-if __name__ == "__main__":
-    logger.info("Starting server with transport=%s port=%s", _args.transport, _args.port)
+# ── Data tools ────────────────────────────────────────────────────────────────
+@mcp.tool()
+def list_customers() -> list[dict]:
+    """Return all customer records."""
+    db = get_db()
+    return db["customers"]
 
-    # mcp.run() starts the server and blocks until it is shut down.
-    # transport="stdio" is required for Claude Desktop integration.
-    # transport="http"  is handy for manual testing with curl or a browser.
-    mcp.run(transport=_args.transport)
+
+@mcp.tool()
+def read_job(job_id: str) -> dict:
+    """Return a full job record including its tasks and status.
+
+    Args:
+        job_id: The id field of the job to look up.
+
+    Returns:
+        The job dict with a 'tasks' key added, or an error dict if not found.
+    """
+    db = get_db()
+    job = next((j for j in db["jobs"] if j["id"] == job_id), None)
+    if job is None:
+        return {"error": f"Job {job_id!r} not found"}
+    # Copy the dict before adding 'tasks' so we don't mutate the cached record
+    # in _db — without this, the tasks key would persist across future calls.
+    job = dict(job)
+    job["tasks"] = [t for t in db["tasks"] if t["job_id"] == job_id]
+    return job
+
+
+# VALID_ENTITIES is defined outside the function so it is only created once,
+# not rebuilt on every call. It also documents the supported entity types clearly.
+VALID_ENTITIES = {"Customer", "Job", "Invoice", "Task"}
+
+
+@mcp.tool()
+def create_record(entity: str, data: dict) -> dict:
+    """Create a new record and persist it to the data store.
+
+    Args:
+        entity: One of Customer | Job | Invoice | Task
+        data:   Dict of fields for that entity (id and created_at are auto-set).
+
+    Returns:
+        A dict with 'ok', 'id', and 'entity' on success, or 'error' on failure.
+    """
+    if entity not in VALID_ENTITIES:
+        return {"error": f"Unknown entity {entity!r}. Must be one of {VALID_ENTITIES}"}
+
+    db = get_db()
+    record = {
+        "id": str(uuid.uuid4()),
+        # datetime.timezone.utc produces a timezone-aware timestamp.
+        # utcnow() is deprecated in Python 3.12+ so we use now(utc) instead.
+        "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        **data,   # spread the caller's fields in after the auto-set ones
+    }
+    db[entity.lower() + "s"].append(record)
+    write_db(db)
+    return {"ok": True, "id": record["id"], "entity": entity}
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    logger.info("Starting server with transport=stdio")
+    mcp.run()
