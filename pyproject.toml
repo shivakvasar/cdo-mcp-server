@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cdo-mcp-server"
+version = "0.1.0"
+description = "MCP server exposing the CDO canonical data model (customers, jobs, tasks, invoices) as tools for Claude"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.27.2",
+]
+
+[project.scripts]
+cdo-mcp-server = "cdo_mcp_server.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

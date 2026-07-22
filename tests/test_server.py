@@ -1,9 +1,9 @@
 """Tests for the CDO MCP server tools.
 
-Each @mcp.tool()-decorated function in src/server.py is just a normal Python
-function underneath the decorator (FastMCP registers it but returns it
-unchanged), so we can import and call them directly here instead of having
-to spin up the real MCP stdio server and talk to it over JSON-RPC.
+Each @mcp.tool()-decorated function in src/cdo_mcp_server/server.py is just a
+normal Python function underneath the decorator (FastMCP registers it but
+returns it unchanged), so we can import and call them directly here instead
+of having to spin up the real MCP stdio server and talk to it over JSON-RPC.
 
 Pytest auto-discovers this file because it's named test_*.py, and it treats
 every function named test_* as its own independent test case.
@@ -13,16 +13,18 @@ import sys
 
 import pytest
 
-# server.py does this same trick so `from data import ...` works no matter
-# how it's run. We need it here too since this test file imports from src/.
+# cdo_mcp_server lives under src/, following the "src layout" convention.
+# Adding src/ (not the package itself) to sys.path lets us import it as a
+# normal package below without requiring `pip install -e .` first.
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent / "src"))
 
-# Imported as a module (not `from data import get_db`) so that when a test
-# does monkeypatch.setattr(data_module, "DB_PATH", ...), every other piece of
-# code that later calls data.get_db() sees the patched value too. If we'd
-# imported get_db by name instead, patching data_module wouldn't affect it.
-import data as data_module
-from server import create_record, echo, list_customers, read_job, status
+# Imported as a module (not `from cdo_mcp_server.data import get_db`) so that
+# when a test does monkeypatch.setattr(data_module, "DB_PATH", ...), every
+# other piece of code that later calls data.get_db() sees the patched value
+# too. If we'd imported get_db by name instead, patching data_module
+# wouldn't affect it.
+import cdo_mcp_server.data as data_module
+from cdo_mcp_server.server import create_record, echo, list_customers, read_job, status
 
 
 @pytest.fixture(autouse=True)
@@ -118,7 +120,7 @@ def test_read_job_returns_job_with_its_tasks():
 
     assert job["title"] == "Rewire"
     # read_job() adds a "tasks" key by filtering db["tasks"] for matching
-    # job_id (see src/server.py's read_job) — confirm that logic worked.
+    # job_id (see cdo_mcp_server/server.py's read_job) — confirm that logic worked.
     assert len(job["tasks"]) == 1
     assert job["tasks"][0]["title"] == "Survey"
 

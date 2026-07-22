@@ -8,17 +8,12 @@ All logging goes to stderr so it does not pollute the stdio message stream.
 # ── Imports ───────────────────────────────────────────────────────────────────
 import datetime   # for timestamping new records
 import logging    # for diagnostic messages to stderr
-import pathlib    # for resolving the src/ directory path
-import sys        # for sys.stderr (log destination) and sys.path
+import sys        # for sys.stderr (log destination)
 import uuid       # for generating unique IDs on new records
 
 from mcp.server.fastmcp import FastMCP   # high-level MCP server library
 
-# Ensure the src/ directory is on sys.path so `from data import ...` works
-# whether this file is run directly (python src/server.py) or imported as a
-# package (from src.server import ...) — e.g. in tests.
-sys.path.insert(0, str(pathlib.Path(__file__).parent))
-from data import get_db, write_db
+from .data import get_db, write_db
 
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
@@ -136,6 +131,11 @@ def create_record(entity: str, data: dict) -> dict:
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
-if __name__ == "__main__":
+def main() -> None:
+    """Console-script entry point (see [project.scripts] in pyproject.toml)."""
     logger.info("Starting server with transport=stdio")
     mcp.run()
+
+
+if __name__ == "__main__":
+    main()
