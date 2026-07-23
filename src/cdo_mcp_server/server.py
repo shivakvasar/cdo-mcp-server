@@ -13,7 +13,10 @@ import uuid       # for generating unique IDs on new records
 
 from mcp.server.fastmcp import FastMCP   # high-level MCP server library
 
-from .data import get_db, write_db
+# Imported as a module, aliased to `db` rather than `data` — create_record's
+# own `data` parameter below (part of its public tool signature, so it can't
+# just be renamed) would otherwise shadow the module name inside that function.
+from . import data as db
 
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
@@ -73,8 +76,26 @@ def status() -> dict:
 @mcp.tool()
 def list_customers() -> list[dict]:
     """Return all customer records."""
-    db = get_db()
-    return db["customers"]
+    return db.list_records("customers")
+
+
+# list_jobs and list_invoices are deliberately just list_customers with the
+# table name swapped — same shape, same "-> list[dict]" return type. Keeping
+# them this simple/uniform matters: any script that treats one of these as
+# an MCP client (see scripts/ops_summary.py) can rely on all three behaving
+# identically over the wire (FastMCP wraps list[dict] returns as
+# {"result": [...]} in structuredContent, verified by hand against a real
+# call — dict-only return types like read_job's don't get that treatment).
+@mcp.tool()
+def list_jobs() -> list[dict]:
+    """Return all job records (without their tasks — see read_job for that)."""
+    return db.list_records("jobs")
+
+
+@mcp.tool()
+def list_invoices() -> list[dict]:
+    """Return all invoice records."""
+    return db.list_records("invoices")
 
 
 @mcp.tool()
@@ -87,14 +108,10 @@ def read_job(job_id: str) -> dict:
     Returns:
         The job dict with a 'tasks' key added, or an error dict if not found.
     """
-    db = get_db()
-    job = next((j for j in db["jobs"] if j["id"] == job_id), None)
+    job = db.get_record("jobs", job_id)
     if job is None:
         return {"error": f"Job {job_id!r} not found"}
-    # Copy the dict before adding 'tasks' so we don't mutate the cached record
-    # in _db — without this, the tasks key would persist across future calls.
-    job = dict(job)
-    job["tasks"] = [t for t in db["tasks"] if t["job_id"] == job_id]
+    job["tasks"] = db.list_records_by_fk("tasks", job_id)
     return job
 
 
@@ -117,17 +134,12 @@ def create_record(entity: str, data: dict) -> dict:
     if entity not in VALID_ENTITIES:
         return {"error": f"Unknown entity {entity!r}. Must be one of {VALID_ENTITIES}"}
 
-    db = get_db()
-    record = {
-        "id": str(uuid.uuid4()),
-        # datetime.timezone.utc produces a timezone-aware timestamp.
-        # utcnow() is deprecated in Python 3.12+ so we use now(utc) instead.
-        "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        **data,   # spread the caller's fields in after the auto-set ones
-    }
-    db[entity.lower() + "s"].append(record)
-    write_db(db)
-    return {"ok": True, "id": record["id"], "entity": entity}
+    record_id = str(uuid.uuid4())
+    # datetime.timezone.utc produces a timezone-aware timestamp.
+    # utcnow() is deprecated in Python 3.12+ so we use now(utc) instead.
+    created_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    db.insert_record(entity.lower() + "s", record_id, created_at, data)
+    return {"ok": True, "id": record_id, "entity": entity}
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

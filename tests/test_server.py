@@ -5,12 +5,18 @@ normal Python function underneath the decorator (FastMCP registers it but
 returns it unchanged), so we can import and call them directly here instead
 of having to spin up the real MCP stdio server and talk to it over JSON-RPC.
 
+Requires a running Postgres (see docker-compose.yml: `docker compose up -d`)
+— data.py has no in-memory/file fallback anymore, so every test in this file
+needs a real database to talk to.
+
 Pytest auto-discovers this file because it's named test_*.py, and it treats
 every function named test_* as its own independent test case.
 """
+import os
 import pathlib
 import sys
 
+import psycopg
 import pytest
 
 # cdo_mcp_server lives under src/, following the "src layout" convention.
@@ -18,18 +24,36 @@ import pytest
 # normal package below without requiring `pip install -e .` first.
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent / "src"))
 
-# Imported as a module (not `from cdo_mcp_server.data import get_db`) so that
-# when a test does monkeypatch.setattr(data_module, "DB_PATH", ...), every
-# other piece of code that later calls data.get_db() sees the patched value
-# too. If we'd imported get_db by name instead, patching data_module
-# wouldn't affect it.
-import cdo_mcp_server.data as data_module
-from cdo_mcp_server.server import create_record, echo, list_customers, read_job, status
+from cdo_mcp_server.server import (
+    create_record,
+    echo,
+    list_customers,
+    list_invoices,
+    list_jobs,
+    read_job,
+    status,
+)
+
+# Two separate databases in the same local Postgres instance (both created
+# by docker-compose.yml's init scripts, same schema.sql applied to each):
+#   - cdo_test: throwaway, truncated before every test below.
+#   - cdo:      the real dev database (seeded via
+#               scripts/migrate_json_to_postgres.py) — only the real_db-
+#               marked test at the bottom reads from this one, and only
+#               ever reads, never writes.
+# Overridable via env vars in case CI points its Postgres service elsewhere.
+TEST_DATABASE_URL = os.environ.get(
+    "TEST_DATABASE_URL", "postgresql://cdo:cdo@localhost:5432/cdo_test"
+)
+DEV_DATABASE_URL = os.environ.get(
+    "DATABASE_URL", "postgresql://cdo:cdo@localhost:5432/cdo"
+)
 
 
 @pytest.fixture(autouse=True)
-def isolated_db(request, tmp_path, monkeypatch):
-    """Point the data store at a throwaway file for every test.
+def isolated_db(request, monkeypatch):
+    """Point every tool call at the throwaway cdo_test database, emptied
+    before each test.
 
     A pytest fixture is just a function whose return value (or, for
     generator fixtures like this one, whose value up to the `yield`) pytest
@@ -37,46 +61,35 @@ def isolated_db(request, tmp_path, monkeypatch):
     `autouse=True` means every test in this file gets it automatically,
     without needing to list `isolated_db` as an argument themselves.
 
-    Why this exists: without it, tests would read and write data/db.json —
-    the real database Claude Desktop uses — and would also leak data between
-    tests via the module-level `_db` cache in data.py (get_db() only reads
-    from disk once and then reuses whatever is already in memory, so one
-    test's writes would still be sitting there for the next test).
+    Why this exists: data.py reads the DATABASE_URL environment variable
+    fresh on every connection (see data._connection_string), so pointing it
+    at cdo_test here — instead of the real "cdo" dev database — keeps tests
+    from reading or overwriting the real seeded data (Tan Brothers Pte Ltd,
+    the Office Rewire job, etc.) that Claude Desktop also uses.
 
-    Fixture arguments (pytest supplies all three automatically):
-      request:    info about the test currently requesting this fixture —
-                  used below to check which markers were applied to it.
-      tmp_path:   a pathlib.Path to a fresh, empty directory that pytest
-                  creates for this test and deletes afterwards. Perfect for
-                  a "fake" db.json that won't collide with other tests.
-      monkeypatch: lets us temporarily overwrite an attribute (here,
-                  data_module.DB_PATH and data_module._db) and have it
-                  automatically restored to its original value the moment
-                  this test finishes — even if the test fails or raises.
+    TRUNCATE ... CASCADE before each test (rather than only once) gives every
+    test a guaranteed-empty set of tables to start from, regardless of what
+    an earlier test inserted — the Postgres equivalent of the old fixture's
+    "fresh temp file per test".
 
-    Because this function contains a `yield`, pytest treats it as a
-    "generator fixture": code before `yield` is setup (runs before the
-    test), and anything after `yield` would be teardown (runs after the
-    test). We don't need teardown code here since monkeypatch handles the
-    restoring for us — the bare `yield` just marks "now run the test".
+    monkeypatch.setenv undoes itself automatically after each test, so
+    DATABASE_URL is restored to whatever it was before this test ran.
 
-    Tests marked `@pytest.mark.real_db` (see test_read_job_matches_seeded_db_json
-    below) skip all of this so they can read the actual data/db.json instead.
+    Tests marked `@pytest.mark.real_db` (see
+    test_read_job_matches_seeded_dev_database below) skip all of this so
+    they can read the real "cdo" database instead.
     """
     if "real_db" in request.keywords:
         # request.keywords holds the markers attached to the current test.
-        # If it's marked real_db, skip straight to running the test without
-        # touching DB_PATH or _db at all.
+        # If it's marked real_db, point at the dev database and skip
+        # truncating anything.
+        monkeypatch.setenv("DATABASE_URL", DEV_DATABASE_URL)
         yield
         return
 
-    fake_db_path = tmp_path / "db.json"
-    monkeypatch.setattr(data_module, "DB_PATH", fake_db_path)
-    # data.py's get_db() only loads from disk when _db is None (see its
-    # "Holds the loaded data after the first read" comment), so resetting it
-    # here forces the next get_db() call to load fresh from fake_db_path
-    # instead of reusing whatever a previous test already loaded into memory.
-    monkeypatch.setattr(data_module, "_db", None)
+    monkeypatch.setenv("DATABASE_URL", TEST_DATABASE_URL)
+    with psycopg.connect(TEST_DATABASE_URL, autocommit=True) as conn:
+        conn.execute("TRUNCATE customers, jobs, tasks, invoices CASCADE")
     yield
 
 
@@ -92,12 +105,14 @@ def test_status_lists_all_registered_tools():
     # We don't assert the full tool list (that would break every time a tool
     # is added), just that a couple of the tools we care about are present.
     assert "list_customers" in result["tools"]
+    assert "list_jobs" in result["tools"]
+    assert "list_invoices" in result["tools"]
     assert "create_record" in result["tools"]
 
 
 def test_list_customers_returns_created_customers():
-    # Thanks to isolated_db, the fake db starts completely empty — so we
-    # have to seed it ourselves via create_record before list_customers has
+    # Thanks to isolated_db, cdo_test starts completely empty — so we have
+    # to seed it ourselves via create_record before list_customers has
     # anything to return.
     create_record("Customer", {"name": "Acme Co", "email": "acme@example.com"})
 
@@ -107,11 +122,43 @@ def test_list_customers_returns_created_customers():
     assert customers[0]["name"] == "Acme Co"
 
 
+def test_list_jobs_returns_created_jobs():
+    # Same pattern as test_list_customers_returns_created_customers above:
+    # isolated_db means we start from an empty db, so seed one job first.
+    # jobs.customer_id is a real foreign key (see schema.sql), so the
+    # customer row has to exist before a job can reference its id — unlike
+    # the old JSON store, Postgres actually enforces this.
+    customer = create_record("Customer", {"name": "Acme Co"})
+    create_record(
+        "Job", {"customer_id": customer["id"], "title": "Rewire", "status": "Open"}
+    )
+
+    jobs = list_jobs()
+
+    assert len(jobs) == 1
+    assert jobs[0]["title"] == "Rewire"
+
+
+def test_list_invoices_returns_created_invoices():
+    # invoices.job_id is a real foreign key too, so a job (and the customer
+    # it belongs to) has to exist first.
+    customer = create_record("Customer", {"name": "Acme Co"})
+    job = create_record("Job", {"customer_id": customer["id"], "title": "Rewire"})
+    create_record("Invoice", {"job_id": job["id"], "amount": 500, "status": "Unpaid"})
+
+    invoices = list_invoices()
+
+    assert len(invoices) == 1
+    assert invoices[0]["amount"] == 500
+
+
 def test_read_job_returns_job_with_its_tasks():
-    # Create a job, then a task attached to that job (via job_id), then
-    # check read_job() stitches the two together correctly.
+    # Create a customer, then a job for that customer, then a task attached
+    # to that job (via job_id) — each one a real foreign key now — then
+    # check read_job() stitches the job and its tasks together correctly.
+    customer = create_record("Customer", {"name": "Acme Co"})
     job_result = create_record(
-        "Job", {"customer_id": "cust-1", "title": "Rewire", "status": "Open"}
+        "Job", {"customer_id": customer["id"], "title": "Rewire", "status": "Open"}
     )
     job_id = job_result["id"]
     create_record("Task", {"job_id": job_id, "title": "Survey", "done": False})
@@ -119,8 +166,8 @@ def test_read_job_returns_job_with_its_tasks():
     job = read_job(job_id)
 
     assert job["title"] == "Rewire"
-    # read_job() adds a "tasks" key by filtering db["tasks"] for matching
-    # job_id (see cdo_mcp_server/server.py's read_job) — confirm that logic worked.
+    # read_job() adds a "tasks" key via data.list_records_by_fk("tasks", ...)
+    # (see cdo_mcp_server/server.py's read_job) — confirm that logic worked.
     assert len(job["tasks"]) == 1
     assert job["tasks"][0]["title"] == "Survey"
 
@@ -140,18 +187,19 @@ def test_create_record_persists_and_returns_id():
 
 
 @pytest.mark.real_db
-def test_read_job_matches_seeded_db_json():
-    """Regression check against the real data/db.json shipped with the repo.
+def test_read_job_matches_seeded_dev_database():
+    """Regression check against the real "cdo" dev database.
 
-    Every test above runs against an isolated temp file so it can't touch the
-    real database. This one intentionally opts out of that isolation (see
-    the `real_db` marker check in the isolated_db fixture above) so it reads
-    data/db.json exactly as Claude Desktop would — catching accidental drift
-    in the seed data, e.g. if job-1's title or tasks get edited by hand.
+    Every test above runs against the throwaway cdo_test database so it
+    can't touch real data. This one intentionally opts out of that
+    isolation (see the `real_db` marker check in the isolated_db fixture
+    above) so it reads the actual dev database exactly as Claude Desktop
+    would — catching accidental drift in the seed data, e.g. if job-1's
+    title or tasks get edited by hand.
 
     Read-only on purpose: it must never call create_record here, since that
-    would permanently write test data into the real database file that
-    Claude Desktop also reads from.
+    would permanently write test data into the same database Claude Desktop
+    reads from.
     """
     job = read_job("job-1")
 

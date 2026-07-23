@@ -1,0 +1,52 @@
+name: Weekly Ops Summary
+
+on:
+  schedule:
+    - cron: '0 7 * * 1'   # Every Monday at 7:00 AM UTC
+  workflow_dispatch:        # Manual trigger for testing
+
+permissions:
+  contents: write           # Needed to commit report to reports/
+
+jobs:
+  ops-summary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      # `-e .` installs this repo itself (pulling in its one real runtime
+      # dependency, `mcp`, from pyproject.toml) so scripts/ops_summary.py can
+      # spawn `cdo-mcp-server` as a subprocess. `anthropic` is installed
+      # separately since it's only needed by this script, not by the MCP
+      # server itself — pyproject.toml deliberately doesn't list it.
+      - name: Install dependencies
+        run: |
+          pip install -e . anthropic
+
+      # scripts/ops_summary.py calls the server's own list_jobs/
+      # list_invoices/list_customers tools over MCP (not data/db.json
+      # directly), then asks Claude to summarize what it gets back.
+      - name: Run Ops Summary via Claude
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: python scripts/ops_summary.py
+
+      # `git diff --cached --quiet || git commit` only commits if
+      # ops_summary.py actually produced a new/changed report — reruns on
+      # the same day (e.g. via workflow_dispatch) won't create empty commits.
+      - name: Commit report to reports/
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add reports/
+          git diff --cached --quiet || git commit -m "chore: weekly ops summary $(date +'%Y-%m-%d')"
+          git push
