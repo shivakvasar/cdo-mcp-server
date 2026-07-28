@@ -13,6 +13,30 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
+    # Since commit 27fc7a3 ("Move canonical data store from JSON file to
+    # PostgreSQL"), the MCP server's list_jobs/list_invoices/list_customers
+    # tools read from Postgres, not data/db.json directly — so this job
+    # needs a real Postgres to talk to. Mirrors .github/workflows/test.yml's
+    # service container exactly (see that file for why the init-script
+    # volumes from docker-compose.yml can't be reused here).
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: cdo
+          POSTGRES_PASSWORD: cdo
+          POSTGRES_DB: cdo
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U cdo -d cdo"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+
+    env:
+      DATABASE_URL: postgresql://cdo:cdo@localhost:5432/cdo
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -23,14 +47,26 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      # `-e .` installs this repo itself (pulling in its one real runtime
-      # dependency, `mcp`, from pyproject.toml) so scripts/ops_summary.py can
-      # spawn `cdo-mcp-server` as a subprocess. `anthropic` is installed
-      # separately since it's only needed by this script, not by the MCP
-      # server itself — pyproject.toml deliberately doesn't list it.
+      # `-e .` installs this repo itself (pulling in its real runtime
+      # dependencies, `mcp` and `psycopg`, from pyproject.toml) so
+      # scripts/ops_summary.py can spawn `cdo-mcp-server` as a subprocess.
+      # `anthropic` is installed separately since it's only needed by this
+      # script, not by the MCP server itself — pyproject.toml deliberately
+      # doesn't list it.
       - name: Install dependencies
         run: |
           pip install -e . anthropic
+
+      # Applies schema.sql to the "cdo" database the service container just
+      # started empty, then loads the same seed data (e.g. "Tan Brothers
+      # Pte Ltd") local dev uses — see scripts/migrate_json_to_postgres.py.
+      # ubuntu-latest ships psql preinstalled.
+      - name: Set up and seed database
+        env:
+          PGPASSWORD: cdo
+        run: |
+          psql -h localhost -U cdo -d cdo -f schema.sql
+          python scripts/migrate_json_to_postgres.py
 
       # scripts/ops_summary.py calls the server's own list_jobs/
       # list_invoices/list_customers tools over MCP (not data/db.json
