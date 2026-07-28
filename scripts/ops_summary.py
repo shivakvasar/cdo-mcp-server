@@ -73,7 +73,15 @@ async def fetch_ops_data() -> dict:
     any call_tool() — skipping it would fail since the server doesn't know
     the client's capabilities yet.
     """
-    params = StdioServerParameters(command="cdo-mcp-server", args=[])
+    # StdioServerParameters does NOT inherit the parent process's full
+    # environment by default — if `env` is left unset, the mcp SDK spawns
+    # the subprocess with only a small allowlist of "safe" vars (PATH, HOME,
+    # etc.), for security, since MCP servers are often third-party. That
+    # silently drops DATABASE_URL, which src/cdo_mcp_server/data.py needs to
+    # connect to Postgres — so it must be passed through explicitly here.
+    params = StdioServerParameters(
+        command="cdo-mcp-server", args=[], env={"DATABASE_URL": os.environ["DATABASE_URL"]}
+    )
     async with stdio_client(params) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
