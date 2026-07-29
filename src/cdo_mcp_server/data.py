@@ -50,20 +50,26 @@ def _get_connection() -> psycopg.Connection:
     return psycopg.connect(_connection_string(), row_factory=dict_row, autocommit=True)
 
 
-def _row_to_record(row: dict) -> dict:
+def _row_to_record(table: str, row: dict) -> dict:
     """Flatten a fetched row (fixed columns + a `data` JSONB blob) back into
     the same flat dict shape the rest of the server has always worked with
     — e.g. {"id": ..., "customer_id": ..., "created_at": ..., "title": ...}
     rather than {"id": ..., "customer_id": ..., "data": {"title": ...}}.
+
+    The real columns are applied *after* the JSONB blob so that id/created_at/
+    the FK column always win, even if a stray same-named key ended up inside
+    `data` (e.g. from an old insert that didn't strip it — see
+    insert_record). The FK column is looked up from _FK_COLUMN by table name
+    rather than inferred by excluding known column names from the row, so a
+    future real column (e.g. an updated_at) can't get misidentified as the FK
+    and leak a non-JSON-serializable value into the record.
     """
-    record = {"id": row["id"], "created_at": row["created_at"].isoformat()}
-    # Any column besides id/created_at/data is this table's FK column
-    # (customer_id or job_id) — include it only if this row actually has
-    # one set (customers have no such column at all).
-    fk_column = next((c for c in row if c not in ("id", "created_at", "data")), None)
-    if fk_column and row[fk_column] is not None:
+    record = dict(row["data"])
+    record["id"] = row["id"]
+    record["created_at"] = row["created_at"].isoformat()
+    fk_column = _FK_COLUMN.get(table)
+    if fk_column and row.get(fk_column) is not None:
         record[fk_column] = row[fk_column]
-    record.update(row["data"])
     return record
 
 
@@ -72,7 +78,7 @@ def list_records(table: str) -> list[dict]:
     query = sql.SQL("SELECT * FROM {} ORDER BY created_at").format(sql.Identifier(table))
     with _get_connection() as conn:
         rows = conn.execute(query).fetchall()
-    return [_row_to_record(r) for r in rows]
+    return [_row_to_record(table, r) for r in rows]
 
 
 def get_record(table: str, record_id: str) -> dict | None:
@@ -80,7 +86,7 @@ def get_record(table: str, record_id: str) -> dict | None:
     query = sql.SQL("SELECT * FROM {} WHERE id = %s").format(sql.Identifier(table))
     with _get_connection() as conn:
         row = conn.execute(query, (record_id,)).fetchone()
-    return _row_to_record(row) if row else None
+    return _row_to_record(table, row) if row else None
 
 
 def list_records_by_fk(table: str, fk_value: str) -> list[dict]:
@@ -93,7 +99,7 @@ def list_records_by_fk(table: str, fk_value: str) -> list[dict]:
     )
     with _get_connection() as conn:
         rows = conn.execute(query, (fk_value,)).fetchall()
-    return [_row_to_record(r) for r in rows]
+    return [_row_to_record(table, r) for r in rows]
 
 
 def insert_record(table: str, record_id: str, created_at: str, fields: dict) -> None:
@@ -103,6 +109,11 @@ def insert_record(table: str, record_id: str, created_at: str, fields: dict) -> 
     """
     fk_column = _FK_COLUMN[table]
     extra = dict(fields)
+    # id/created_at already have their own real columns (record_id/created_at
+    # above) — strip them here so they can never also end up in the JSONB
+    # blob and shadow the real column on read (see _row_to_record).
+    extra.pop("id", None)
+    extra.pop("created_at", None)
     fk_value = extra.pop(fk_column, None) if fk_column else None
 
     columns = ["id", "created_at", "data"]

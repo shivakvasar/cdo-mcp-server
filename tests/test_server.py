@@ -186,6 +186,27 @@ def test_create_record_persists_and_returns_id():
     assert any(c["id"] == result["id"] for c in customers)
 
 
+def test_create_record_payload_cannot_spoof_id():
+    """A stray "id" inside the data payload must never shadow the real
+    primary key on read.
+
+    Regression test for a bug in data.py's _row_to_record: it used to merge
+    the JSONB `data` blob into the record *after* setting the real id, so a
+    caller-supplied "id" field (e.g. from copying an existing record's dict
+    into create_record) would silently overwrite the real UUID primary key,
+    making the row unreachable by its actual id afterward.
+    """
+    result = create_record("Customer", {"name": "Acme Co", "id": "spoofed-id"})
+
+    real_id = result["id"]
+    assert real_id != "spoofed-id"
+
+    customers = list_customers()
+    assert len(customers) == 1
+    # The record must be reachable under its real id, not the spoofed one.
+    assert customers[0]["id"] == real_id
+
+
 @pytest.mark.real_db
 def test_read_job_matches_seeded_dev_database():
     """Regression check against the real "cdo" dev database.
