@@ -76,6 +76,16 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: python scripts/ops_summary.py
 
+      # Uploads the report as a downloadable build artifact in addition to
+      # the git commit below — gives a 90-day-retained copy reachable via
+      # `gh run download` without needing to pull git history.
+      - name: Upload report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: weekly-ops-summary-report
+          path: reports/
+          retention-days: 90
+
       # `git diff --cached --quiet || git commit` only commits if
       # ops_summary.py actually produced a new/changed report — reruns on
       # the same day (e.g. via workflow_dispatch) won't create empty commits.
